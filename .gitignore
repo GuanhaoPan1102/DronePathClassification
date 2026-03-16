@@ -1,0 +1,21 @@
+# == Build Artifacts ==
+build/
+managed_components/
+dependencies.lock
+*.bin
+*.elf
+
+# == VS Code & Toolchain Caches ==
+.vscode/
+.cache/
+*.code-workspace
+
+# == Python Build Caches (Used by ESP-IDF Tools) ==
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# == System Specific ==
+.DS_Store
+Thumbs.db
