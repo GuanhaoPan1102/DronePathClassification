@@ -5,10 +5,12 @@ dependencies.lock
 *.bin
 *.elf
 
-# == VS Code & Toolchain Caches ==
+# == VS Code & Dev Container ==
 .vscode/
 .cache/
 *.code-workspace
+.devcontainer/
+
 
 # == Python Build Caches (Used by ESP-IDF Tools) ==
 __pycache__/
