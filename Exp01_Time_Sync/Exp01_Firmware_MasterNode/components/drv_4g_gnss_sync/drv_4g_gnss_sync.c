@@ -7,8 +7,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "driver/uart.h"
-#include "driver/gpio.h"
-#include "esp_timer.h" // 引入高精度硬體計時器
+#include "esp_timer.h" 
 #include "esp_log.h"
 #include "drv_4g_gnss_sync.h"
 
@@ -30,13 +29,14 @@ static float   _sum_alt = 0.0f;
 static gps_fix_t _final_fix = {0};
 
 // ==========================================
-// 核心魔法：寂靜模式與硬體時間補償變數
+// 軟體 PPS (Leading-Edge Sync) 核心變數
 // ==========================================
-static volatile bool _is_in_silent_mode = false;        // 是否進入寂靜模式
-static volatile bool _pps_triggered = false;            // 通知 Task 執行時間同步
 static volatile time_t _next_utc_sec = 0;               // 下一秒的 UTC 秒數預報
-static volatile int64_t _pps_hardware_timestamp_us = 0; // 紀錄 PPS 發生的硬體瞬間
-static volatile int64_t _last_pps_hw_us = 0;            // 上一次 PPS 的硬體時間 (用於漏跳交叉比對)
+static int64_t _last_uart_rx_time_us = 0;               // 上次收到 UART 字元的系統微秒時間 (用於沉默期檢測)
+
+// 定義 NMEA 爆發之間的最小沉默期 (微秒)。
+// 假設 1Hz 輸出，爆發期約耗時 100ms，沉默期應大於 500ms (500,000us)
+#define NMEA_SILENCE_THRESHOLD_US 500000 
 
 // ==========================================
 // 輔助函式
@@ -46,74 +46,6 @@ static int32_t _convert_nmea_to_scaled(float nmea_val)
     int degrees = (int)(nmea_val / 100);             
     float minutes = nmea_val - (degrees * 100);      
     return (int32_t)((degrees + (minutes / 60.0f)) * 10000000);        
-}
-
-// ==========================================
-// 零死鎖中斷與交叉比對防呆 (ISR)
-// ==========================================
-static void IRAM_ATTR pps_gpio_isr_handler(void* arg)
-{
-    // 1. 瞬間拍下硬體微秒快照
-    int64_t current_hw_us = esp_timer_get_time();
-    _pps_hardware_timestamp_us = current_hw_us;
-
-    // 2. 寂靜模式 (NMEA 關閉) 下的自體計秒與漏跳補償
-    if (_is_in_silent_mode && _last_pps_hw_us > 0) {
-        int64_t diff_us = current_hw_us - _last_pps_hw_us;
-        // 四捨五入計算經過的秒數 (防護 PPS 漏跳)
-        int passed_sec = (diff_us + 500000) / 1000000; 
-        
-        if (passed_sec > 0) {
-            _next_utc_sec += passed_sec;
-        }
-    }
-
-    // 3. 記錄歷史時間並立旗，交給 Task 處理
-    _last_pps_hw_us = current_hw_us;
-    if (_next_utc_sec > 0) {
-        _pps_triggered = true;
-    }
-}
-
-// ==========================================
-// 底層時間推遲處理 (Task Context)
-// ==========================================
-static void _process_time_sync_safe(void)
-{
-    if (_pps_triggered) {
-        _pps_triggered = false; // 放下旗標
-
-        // 1. 計算這段 Task 被延遲了幾微秒
-        int64_t current_hw_time = esp_timer_get_time();
-        int64_t processing_delay_us = current_hw_time - _pps_hardware_timestamp_us;
-        
-        // 2. 補償並寫入系統時間
-        struct timeval tv;
-        tv.tv_sec = _next_utc_sec;
-        tv.tv_usec = processing_delay_us; 
-        
-        settimeofday(&tv, NULL);
-        
-        if (!_final_fix.is_time_synced) {
-            _final_fix.is_time_synced = true;
-            ESP_LOGI(TAG, "System Time Synced! Initial delay compensated: %lld us", processing_delay_us);
-
-            // 獲取當前系統時間
-            time_t now;
-            struct tm timeinfo;
-            char strftime_buf[64];
-            time(&now); 
-            
-            // 加上 8 小時的秒數 (8 * 3600 = 28800) 轉換為 UTC+8
-            time_t local_now = now + 28800; 
-            
-            // 改用 gmtime_r 避免受到系統 TZ 變數 (UTC) 的影響
-            gmtime_r(&local_now, &timeinfo); 
-            strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
-            // 標註為 UTC+8
-            ESP_LOGI(TAG, "Current System Time: %s (UTC+8)", strftime_buf);
-        }
-    }
 }
 
 // ==========================================
@@ -138,7 +70,7 @@ static void _parse_rmc(char *line)
         field++;
     }
 
-    // 更新時間預報 (準備給下一次 PPS 觸發使用)
+    // 預報：解析當前的 RMC 時間，計算並儲存「下一秒」的標準 UTC 時間
     if (raw_date > 0 && raw_time > 0) {
         struct tm tm_struct = {0};
         tm_struct.tm_hour = raw_time / 10000;
@@ -148,7 +80,8 @@ static void _parse_rmc(char *line)
         tm_struct.tm_mon  = ((raw_date % 10000) / 100) - 1; 
         tm_struct.tm_year = (raw_date % 100) + 100;         
 
-        _next_utc_sec = mktime(&tm_struct) + 1; // 預報下一秒
+        // 將解析出的時間轉為秒數，並加 1 秒作為下一次 NMEA 第一個 '$' 的目標時間
+        _next_utc_sec = mktime(&tm_struct) + 1; 
     }
 
     if (!_final_fix.is_fixed && valid) {
@@ -193,7 +126,7 @@ void drv_4g_gnss_process_nmea(const char *nmea_line)
             _final_fix.longitude = (int32_t)(_sum_lon / _rmc_count);
             _final_fix.altitude = _sum_alt / _gga_count;
             _final_fix.is_fixed = true;
-            ESP_LOGI(TAG, "MASTER Node Position FIXED! Wait for PPS...");
+            ESP_LOGI(TAG, "MASTER Node Position FIXED! Software PPS Sync Active.");
         }
     } else if (strstr(buf, "GGA")) {
         _parse_gga(buf);
@@ -201,7 +134,7 @@ void drv_4g_gnss_process_nmea(const char *nmea_line)
 }
 
 // ==========================================
-// 字元級分流路由器 (Router Task)
+// 字元級分流路由器 (Router Task) - 包含軟體 PPS 邏輯
 // ==========================================
 static void task_4g_uart_rx(void *pvParameters)
 {
@@ -210,13 +143,42 @@ static void task_4g_uart_rx(void *pvParameters)
     int line_idx = 0;
     
     for (;;) {
-        // 安全地處理背景時間同步
-        _process_time_sync_safe();
-
-        // 採用超短超時，確保系統敏捷度
+        // 採用超短超時 (10ms)，確保能迅速抓到單一字元
         int len = uart_read_bytes(UART_4G_PORT_NUM, &rx_byte, 1, 10 / portTICK_PERIOD_MS);
         
         if (len > 0) {
+            int64_t current_hw_us = esp_timer_get_time();
+            
+            // ==========================================
+            // 軟體 PPS 核心邏輯：偵測沉默期與第一顆 '$'
+            // ==========================================
+            if (rx_byte == '$') {
+                // 如果距離上次收到字元的時間大於沉默門檻，這就是新一秒的「第一顆 $」
+                if ((current_hw_us - _last_uart_rx_time_us) > NMEA_SILENCE_THRESHOLD_US) {
+                    
+                    // 如果我們已經有下一秒的預報時間，立刻寫入系統時間！
+                    if (_next_utc_sec > 0) {
+                        struct timeval tv;
+                        tv.tv_sec = _next_utc_sec;
+                        // 這裡可以加入微小的固定補償值 (例如 GNSS 內部運算延遲，依實驗微調)
+                        tv.tv_usec = 35000; // 假設 GNSS 模組從整秒到吐出第一個 $ 耗時 35ms
+                        
+                        settimeofday(&tv, NULL);
+                        
+                        if (!_final_fix.is_time_synced) {
+                            _final_fix.is_time_synced = true;
+                            ESP_LOGI(TAG, "System Time Synced via Software PPS (Leading Edge)!");
+                        }
+                    }
+                }
+            }
+            
+            // 更新最後一次收到字元的時間
+            _last_uart_rx_time_us = current_hw_us;
+
+            // ==========================================
+            // 一般字串處理邏輯
+            // ==========================================
             // 攔截不帶換行符的 TCP 特殊字元
             if (rx_byte == '>') {
                 xEventGroupSetBits(g_at_event_group, AT_EVENT_OK);
@@ -232,10 +194,8 @@ static void task_4g_uart_rx(void *pvParameters)
                 line_buf[line_idx] = '\0';
                 
                 if (line_buf[0] == '$') {
-                    // 只有在非寂靜模式下才解析 NMEA
-                    if (!_is_in_silent_mode) {
-                        drv_4g_gnss_process_nmea(line_buf);
-                    }
+                    // 永遠進行 NMEA 解析，以維持 _next_utc_sec 的更新
+                    drv_4g_gnss_process_nmea(line_buf);
                 } 
                 else {
                     if (strstr(line_buf, "OK") || strstr(line_buf, "+CIPOPEN: SUCCESS") || strstr(line_buf, "+CIPSEND:SUCCESS")) {
@@ -256,7 +216,7 @@ static void task_4g_uart_rx(void *pvParameters)
 // ==========================================
 esp_err_t drv_4g_init(void)
 {
-    ESP_LOGI(TAG, "Initializing 4G Module & GNSS Engine (V2 Architecture)...");
+    ESP_LOGI(TAG, "Initializing 4G Module & GNSS Engine (Software PPS Architecture)...");
 
     setenv("TZ", "UTC", 1);
     tzset();
@@ -273,23 +233,16 @@ esp_err_t drv_4g_init(void)
         .source_clk = UART_SCLK_DEFAULT,
     };
     
+    // 為了降低硬體緩衝區造成的延遲，可以考慮在 uart_driver_install 後，將 RX Full Threshold 調低
+    // 這裡我們維持預設，透過超短 Timeout (10ms) 在 Task 層級盡可能快地抓取字元
     ESP_ERROR_CHECK(uart_driver_install(UART_4G_PORT_NUM, UART_4G_BUF_SIZE, UART_4G_BUF_SIZE, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_4G_PORT_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_4G_PORT_NUM, UART_4G_TX_PIN, UART_4G_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    if (MASTER_PPS_PIN >= 0) {
-        gpio_config_t io_conf = {
-            .intr_type = GPIO_INTR_POSEDGE,
-            .pin_bit_mask = (1ULL << MASTER_PPS_PIN),
-            .mode = GPIO_MODE_INPUT,
-            .pull_up_en = 0,
-            .pull_down_en = 1
-        };
-        gpio_config(&io_conf);
-        gpio_install_isr_service(0);
-        gpio_isr_handler_add(MASTER_PPS_PIN, pps_gpio_isr_handler, NULL);
-    }
+    // 移除所有實體 GPIO PPS 的註冊程式碼
     drv_4g_gnss_reset_fix();
+    
+    // 建立 Router Task
     xTaskCreate(task_4g_uart_rx, "4g_router_task", 4096, NULL, 5, NULL);
     return ESP_OK;
 }
@@ -311,21 +264,18 @@ esp_err_t drv_4g_gnss_power(bool enable) {
     return drv_4g_send_at_cmd(cmd, "OK", 3000, NULL, 0);
 }
 
-// 切換至：校準模式
+// 啟動 NMEA 串流
 esp_err_t drv_4g_start_nmea_stream(void) {
-    _is_in_silent_mode = false; 
-    ESP_LOGI(TAG, "Entering Calibration Mode (NMEA ON)");
+    ESP_LOGI(TAG, "Starting NMEA Stream (Required for Software PPS)");
     return drv_4g_send_at_cmd("AT+MGPSGET=ALL,1\r\n", "OK", 2000, NULL, 0);
 }
 
-// 切換至：寂靜模式
+// 停止 NMEA 串流 (警告：這會癱瘓軟體 PPS)
 esp_err_t drv_4g_stop_nmea_stream(void) {
-    esp_err_t err = drv_4g_send_at_cmd("AT+MGPSGET=ALL,0\r\n", "OK", 2000, NULL, 0);
-    if (err == ESP_OK) {
-        _is_in_silent_mode = true;
-        ESP_LOGI(TAG, "Entering Silent Mode (NMEA OFF, PPS Auto-tracking ON)");
-    }
-    return err;
+    ESP_LOGW(TAG, "WARNING: Stopping NMEA will halt Software PPS Time Sync!");
+    _next_utc_sec = 0; 
+    _final_fix.is_time_synced = false;
+    return drv_4g_send_at_cmd("AT+MGPSGET=ALL,0\r\n", "OK", 2000, NULL, 0);
 }
 
 esp_err_t drv_4g_set_apn(void) {
@@ -355,6 +305,7 @@ void drv_4g_gnss_reset_fix(void) {
     _sum_lat = 0; _sum_lon = 0; _sum_alt = 0.0f;
     _final_fix.is_fixed = false;
     _final_fix.is_time_synced = false;
+    _next_utc_sec = 0;
 }
 
 gps_fix_t drv_4g_gnss_get_fix(void) {

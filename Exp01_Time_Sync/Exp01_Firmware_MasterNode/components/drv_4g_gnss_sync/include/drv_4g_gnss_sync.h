@@ -16,7 +16,6 @@
 #define UART_4G_RX_PIN        18           // ESP32 RX
 #define UART_4G_BAUD_RATE     115200       // 4G 模組速率
 #define UART_4G_BUF_SIZE      2048         // 緩衝區大小
-#define MASTER_PPS_PIN        4            // 接收 4G 模組 PPS 的 GPIO
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,7 +42,6 @@ esp_err_t drv_4g_gnss_power(bool enable);
 // 核心切換機制：啟動校準模式 (NMEA ON)
 esp_err_t drv_4g_start_nmea_stream(void);
 
-// 核心切換機制：啟動寂靜任務模式 (NMEA OFF, 啟動硬體自體推算)
 esp_err_t drv_4g_stop_nmea_stream(void);
 
 esp_err_t drv_4g_set_apn(void);

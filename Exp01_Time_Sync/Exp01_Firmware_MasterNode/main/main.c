@@ -18,7 +18,7 @@
 // ==========================================
 // 實驗設定：Master 節點代號
 // ==========================================
-#define MY_NODE_ID "M1" 
+#define MY_NODE_ID "M1"
 
 static const char *TAG = "SYNC_EXP01_MASTER";
 
@@ -120,16 +120,7 @@ void app_main(void)
     }
 
     // ==========================================
-    // 階段四：進入寂靜模式 (The Magic Happens Here)
-    // ==========================================
-    ESP_LOGW(TAG, "Switching to Silent Mode (NMEA OFF). Relying on PPS Hardware Counter.");
-    
-    // 關閉 NMEA 串流，釋放 UART
-    // 系統時間完全交由 ISR 裡的 esp_timer 硬體微秒快照來維持
-    drv_4g_stop_nmea_stream();
-
-    // ==========================================
-    // 階段五：通知廣播端，Master 已就緒
+    // 階段四：通知廣播端，Master 已就緒
     // ==========================================
     sync_pkt_t ready_pkt;
     memset(&ready_pkt, 0, sizeof(sync_pkt_t));
@@ -145,7 +136,7 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    // 主任務進入休眠，所有的重頭戲都在 on_data_recv 與 pps_gpio_isr_handler 中非同步進行
+    // 主任務進入休眠
     while(1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
