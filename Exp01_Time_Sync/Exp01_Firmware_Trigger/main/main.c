@@ -16,13 +16,13 @@
 #include "sync_experiment_defs.h"
 
 // ==========================================
-// 🚀 實驗室切換開關
-// 0: 居家測試 (只要 S1 報到就開始)
-// 1: 實驗室實戰 (嚴格等待 S1~S4 全員到齊才開始)
+// 實驗室切換開關
+// 0: 居家 (只要 M1/S1 就開始)
+// 1: 實驗室 (嚴格等待 4 台節點到齊才開始)
 // ==========================================
 #define WAIT_ALL_NODES 0 
 
-static const char *TAG = "SYNC_MASTER";
+static const char *TAG = "SYNC_MASTER_TRIGGER";
 static uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 static bool node_ready[TOTAL_NODES] = {false, false, false, false};
@@ -38,12 +38,16 @@ typedef struct {
 } sample_line_t;
 static sample_line_t current_sample;
 
+// ==========================================
+// ESP-NOW 接收回調 (收集各節點回傳的微秒時間戳)
+// ==========================================
 static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
     if (len != sizeof(sync_pkt_t)) return;
     sync_pkt_t *pkt = (sync_pkt_t *)data;
 
     if (pkt->type == MSG_TYPE_READY) {
-        if (strcmp(pkt->node_id, "S1") == 0)      node_ready[0] = true;
+        // 🌟 巧思：將 Master(M1) 視同 S1 處理，完美兼容你的 4 節點架構
+        if (strcmp(pkt->node_id, "S1") == 0 || strcmp(pkt->node_id, "M1") == 0) node_ready[0] = true;
         else if (strcmp(pkt->node_id, "S2") == 0) node_ready[1] = true;
         else if (strcmp(pkt->node_id, "S3") == 0) node_ready[2] = true;
         else if (strcmp(pkt->node_id, "S4") == 0) node_ready[3] = true;
@@ -51,7 +55,7 @@ static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *da
     } 
     else if (pkt->type == MSG_TYPE_REPORT && pkt->seq_num == current_seq) {
         // 將收到的真實時間填入對應的緩衝區
-        if (strcmp(pkt->node_id, "S1") == 0) {
+        if (strcmp(pkt->node_id, "S1") == 0 || strcmp(pkt->node_id, "M1") == 0) {
             current_sample.s1_tv_sec = pkt->tv_sec; current_sample.s1_tv_usec = pkt->tv_usec;
         } else if (strcmp(pkt->node_id, "S2") == 0) {
             current_sample.s2_tv_sec = pkt->tv_sec; current_sample.s2_tv_usec = pkt->tv_usec;
@@ -63,6 +67,9 @@ static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *da
     }
 }
 
+// ==========================================
+// SD 卡初始化
+// ==========================================
 esp_err_t init_sd_card() {
     vTaskDelay(pdMS_TO_TICKS(800)); // 穩定電源電壓
 
@@ -82,6 +89,9 @@ esp_err_t init_sd_card() {
     return esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config, &mount_config, &card);
 }
 
+// ==========================================
+// 主程式
+// ==========================================
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -101,7 +111,7 @@ void app_main(void)
         ESP_LOGI(TAG, "SD Card Mount OK. Opening CSV file...");
         f_log = fopen("/sdcard/sync_exp.csv", "w");
         if (f_log) {
-            // 寫入 4 個節點的完整標頭
+            // 寫入 4 個節點的完整標頭 (M1 的資料會被記錄在 S1 欄位)
             fprintf(f_log, "Seq,S1_Sec,S1_uSec,S2_Sec,S2_uSec,S3_Sec,S3_uSec,S4_Sec,S4_uSec\n");
             ESP_LOGI(TAG, "CSV header written successfully.");
         } else {
@@ -125,7 +135,7 @@ void app_main(void)
             // 實驗室：必須等齊 4 台
             if (node_ready[0] && node_ready[1] && node_ready[2] && node_ready[3]) break;
         } else {
-            // 居家：只要 S1 準備好就開跑
+            // 居家：只要 M1(或 S1) 準備好就開跑
             if (node_ready[0]) break;
         }
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -134,24 +144,35 @@ void app_main(void)
     ESP_LOGI(TAG, "Nodes ready. Experiment starts in 5s.");
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    // 5Hz 廣播迴圈
+    // ==========================================
+    // 絕對精準 5Hz (200ms) 廣播與採樣迴圈
+    // ==========================================
     sync_pkt_t sync_pkt = {.type = MSG_TYPE_SYNC};
     
+    // 記錄大爆炸的絕對起跑線 (Tick 基準點)
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(200); // 嚴格定義 200ms 週期
+
     while (current_seq < MAX_SAMPLES) {
+        
+        // 會計師結帳：多退少補，確保每一圈都在絕對完美的整數週期點醒來
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
         current_seq++;
         
         // 清空緩衝區，沒回傳的節點就會自動補 0
         memset(&current_sample, 0, sizeof(sample_line_t));
-        
         sync_pkt.seq_num = current_seq;
         
-        // 觸發廣播
+        // 1. 觸發廣播 (空中物理耗時 < 1ms)
         esp_now_send(broadcast_mac, (uint8_t *)&sync_pkt, sizeof(sync_pkt));
 
-        // 預留 160ms 等待接收
-        vTaskDelay(pdMS_TO_TICKS(160));
+        // 2. 防禦性等待 (20ms)
+        // 完美涵蓋節點端的 esp_random() % 10 隨機避讓，以及 FreeRTOS 任務切換抖動
+        // 確保所有節點的資料都能透過 on_data_recv 填入 current_sample 中
+        vTaskDelay(pdMS_TO_TICKS(20));
 
-        // 將 4 個節點的數據寫入 SD 卡
+        // 3. 寫入 SD 卡 (可能耗時 2ms ~ 50ms 不等，但不用怕，vTaskDelayUntil 會處理)
         if (f_log) {
             fprintf(f_log, "%lu,%lld,%ld,%lld,%ld,%lld,%ld,%lld,%ld\n", 
                     current_seq, 
@@ -167,9 +188,6 @@ void app_main(void)
                 ESP_LOGI(TAG, "Progress: %lu / %d", current_seq, MAX_SAMPLES);
             }
         }
-        
-        // 補足剩下的 40ms，湊成 200ms (5Hz)
-        vTaskDelay(pdMS_TO_TICKS(40)); 
     }
 
     if (f_log) fclose(f_log);
