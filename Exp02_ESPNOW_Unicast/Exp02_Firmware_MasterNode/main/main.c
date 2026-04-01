@@ -1,189 +1,238 @@
 #include <stdio.h>
 #include <string.h>
+#include <sys/unistd.h>
 #include <sys/time.h>
-#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "driver/gpio.h"
+#include "esp_vfs_fat.h"
+#include "driver/sdmmc_host.h"
+#include "sdmmc_cmd.h"
 
-// 引入 Exp02 專用資料結構與 4G/GNSS 驅動
-#include "espnow_experiment_defs.h"
-#include "drv_4g_gnss_sync.h"
+#include "espnow_experiment_defs.h" 
+#include "drv_4g_gnss_sync.h"      
 
-// ==========================================
-// 實驗設定
-// ==========================================
-#define MY_NODE_ID "M1"
 static const char *TAG = "EXP02_MASTER";
 
-// 統計報表結構
-typedef struct {
-    uint32_t expected_seq;     // 下一個預期收到的序號
-    uint32_t rx_count;         // 成功收到幾包
-    uint32_t lost_count;       // 途中遺失幾包
-    int64_t  total_latency_us; // 累加延遲，用來算平均值
-    int64_t  max_latency_us;   // 記錄最大延遲
-} node_stats_t;
+// Broadcast MAC address for POLL and SCHEDULE messages
+static uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; 
 
-// 陣列索引: 0->S1, 1->S2, 2->S3
-static node_stats_t stats[3] = {0}; 
+// Node readiness status (S1, S2, S3)
+static bool node_ready[3] = {false, false, false}; 
+static FILE *f_log = NULL;
+
+// Experiment parameters
+#define EXPERIMENT_ITERATIONS 6
+#define EXPERIMENT_DURATION_SEC 300
+static const uint32_t freq_schedule[EXPERIMENT_ITERATIONS] = {1, 1, 10, 10, 15, 15};
 
 // ==========================================
-// ESP-NOW 接收回調：抓出掉包元凶與計算延遲
+// Asynchronous SD Card Write Queue
+// ==========================================
+typedef struct {
+    int64_t recv_timestamp_us;
+    char    node_id[4];
+    uint32_t seq_num;
+    int64_t send_timestamp_us;
+} log_item_t;
+
+static QueueHandle_t sd_write_queue;
+
+static void sd_writer_task(void *pvParameters) {
+    log_item_t item;
+    ESP_LOGI(TAG, "SD writer task initialized.");
+    
+    while (1) {
+        if (xQueueReceive(sd_write_queue, &item, portMAX_DELAY) == pdTRUE) {
+            if (f_log != NULL) {
+                int64_t latency_us = item.recv_timestamp_us - item.send_timestamp_us;
+                fprintf(f_log, "%lld,%s,%lu,%lld,%lld\n", 
+                        item.recv_timestamp_us, 
+                        item.node_id, 
+                        item.seq_num, 
+                        item.send_timestamp_us, 
+                        latency_us);
+            }
+        }
+    }
+}
+
+// ==========================================
+// SD Card Initialization
+// ==========================================
+esp_err_t init_sd_card() {
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false, 
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+    sdmmc_card_t *card;
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.width = 1; 
+    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP; 
+
+    ESP_LOGI(TAG, "Mounting SD card...");
+    return esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config, &mount_config, &card);
+}
+
+// ==========================================
+// ESP-NOW Receive Callback
 // ==========================================
 static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
-    // 收到封包的瞬間，立刻抓取絕對系統時間
+    // Capture absolute time upon packet arrival
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    int64_t recv_timestamp_us = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
+    int64_t current_time_us = ((int64_t)tv.tv_sec * 1000000LL) + tv.tv_usec;
 
-    if (len != sizeof(uav_data_pkt_t)) return;
-    uav_data_pkt_t *pkt = (uav_data_pkt_t *)data;
-
-    if (pkt->type == MSG_TYPE_UAV_DUMMY) {
-        int idx = -1;
-        if (strcmp(pkt->node_id, "S1") == 0) idx = 0;
-        else if (strcmp(pkt->node_id, "S2") == 0) idx = 1;
-        else if (strcmp(pkt->node_id, "S3") == 0) idx = 2;
-
-        if (idx >= 0) {
-            uint32_t current_seq = pkt->seq_num;
-
-            // 1. 計算端到端傳輸延遲 (空中飛行時間 + 底層處理時間)
-            int64_t latency_us = recv_timestamp_us - pkt->send_timestamp_us;
+    if (len == sizeof(sync_pkt_t)) {
+        sync_pkt_t *pkt = (sync_pkt_t *)data;
+        if (pkt->type == MSG_TYPE_READY) {
+            if (strcmp(pkt->node_id, "S1") == 0) node_ready[0] = true;
+            else if (strcmp(pkt->node_id, "S2") == 0) node_ready[1] = true;
+            else if (strcmp(pkt->node_id, "S3") == 0) node_ready[2] = true;
+        }
+    }
+    else if (len == sizeof(uav_data_pkt_t)) {
+        uav_data_pkt_t *pkt = (uav_data_pkt_t *)data;
+        if (pkt->type == MSG_TYPE_UAV_DUMMY) {
+            log_item_t log_item = {
+                .recv_timestamp_us = current_time_us,
+                .seq_num = pkt->seq_num,
+                .send_timestamp_us = pkt->send_timestamp_us
+            };
+            strncpy(log_item.node_id, pkt->node_id, 4);
             
-            // 防呆：確保時間軸有正確收斂，剔除異常的負數延遲
-            if (latency_us >= 0) {
-                stats[idx].total_latency_us += latency_us;
-                if (latency_us > stats[idx].max_latency_us) {
-                    stats[idx].max_latency_us = latency_us;
-                }
-            }
-
-            // 2. 掉包稽核邏輯
-            if (stats[idx].expected_seq == 0) {
-                // 第一包初始化基準點
-                stats[idx].expected_seq = current_seq + 1;
-                stats[idx].rx_count++;
-            } else {
-                if (current_seq == stats[idx].expected_seq) {
-                    // 完美接續
-                    stats[idx].rx_count++;
-                    stats[idx].expected_seq++;
-                } else if (current_seq > stats[idx].expected_seq) {
-                    // 發生跳號 (掉包了！)
-                    uint32_t lost = current_seq - stats[idx].expected_seq;
-                    stats[idx].lost_count += lost;
-                    stats[idx].rx_count++;
-                    
-                    ESP_LOGW(TAG, "[DROP] %s lost %lu packets! (Expected: %lu, Got: %lu)", 
-                             pkt->node_id, lost, stats[idx].expected_seq, current_seq);
-                    
-                    // 基準點校正到下一包
-                    stats[idx].expected_seq = current_seq + 1;
-                } else {
-                    // 亂序或重複封包
-                    ESP_LOGW(TAG, "[OUT-OF-ORDER] %s (Expected: %lu, Got: %lu)", 
-                             pkt->node_id, stats[idx].expected_seq, current_seq);
-                }
-            }
+            // Non-blocking write to queue
+            xQueueSendFromISR(sd_write_queue, &log_item, NULL);
         }
     }
 }
 
 // ==========================================
-// 報表列印任務：每 5 秒總結一次戰況
-// ==========================================
-static void stats_print_task(void *pvParameters) {
-    while(1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        
-        printf("\n=========================================================================\n");
-        printf("Exp02 QoS Report (Interval: 5s) | Unicast Packet Loss & Latency\n");
-        printf("=========================================================================\n");
-        
-        for(int i=0; i<3; i++) {
-            uint32_t total = stats[i].rx_count + stats[i].lost_count;
-            float loss_rate = 0.0f;
-            if (total > 0) {
-                loss_rate = ((float)stats[i].lost_count / total) * 100.0f;
-            }
-            
-            // 計算平均延遲 (轉換為毫秒)
-            float avg_latency_ms = 0.0f;
-            float max_latency_ms = (float)stats[i].max_latency_us / 1000.0f;
-            if (stats[i].rx_count > 0) {
-                avg_latency_ms = ((float)stats[i].total_latency_us / stats[i].rx_count) / 1000.0f;
-            }
-            
-            printf("[S%d] RX: %-5lu | LOST: %-4lu | LOSS: %5.2f%% | AVG LAT: %6.2f ms | MAX LAT: %6.2f ms\n", 
-                   i+1, stats[i].rx_count, stats[i].lost_count, loss_rate, avg_latency_ms, max_latency_ms);
-        }
-        printf("=========================================================================\n\n");
-    }
-}
-
-// ==========================================
-// 主程式
+// Main Application
 // ==========================================
 void app_main(void)
 {
-    // 電源腳位重置 (繼承自你的 Exp01 Master 設定)
+    // Power on 4G/GNSS module
     gpio_reset_pin(21);
     gpio_set_direction(21, GPIO_MODE_OUTPUT);
+    gpio_set_level(21, 1);
 
-    // ---------------------------------------------------------
-    // 1. 基礎環境與 Wi-Fi 初始化
-    // ---------------------------------------------------------
+    // System and WiFi initialization
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR)); // 必須跟 Slave 一樣開 LR
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR));
     ESP_ERROR_CHECK(esp_wifi_start());
-    
-    // 鎖定 Channel 1，確保 100% 物理層對接
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
 
-    // ---------------------------------------------------------
-    // 2. 初始化 Master 專用的 4G/GNSS 驅動，等待時間校準
-    // ---------------------------------------------------------
-    ESP_LOGI(TAG, "Initializing 4G/GNSS Sync Engine...");
-    ESP_ERROR_CHECK(drv_4g_init());
+    // Initialize SD card and writer queue
+    init_sd_card();
+    sd_write_queue = xQueueCreate(500, sizeof(log_item_t));
+    xTaskCreatePinnedToCore(sd_writer_task, "sd_writer", 4096, NULL, 5, NULL, 1);
 
+    // ESP-NOW initialization
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(on_data_recv));
+    esp_now_peer_info_t peer = {.channel = 0, .encrypt = false};
+    memcpy(peer.peer_addr, broadcast_mac, 6);
+    ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+
+    // GNSS initialization and time synchronization
+    ESP_LOGI(TAG, "Initializing 4G/GNSS sync engine...");
+    ESP_ERROR_CHECK(drv_4g_init());
     drv_4g_gnss_power(true);
     drv_4g_start_nmea_stream();
 
-    ESP_LOGI(TAG, "Waiting for 3D Fix and GNSS Time Sync...");
-
+    ESP_LOGI(TAG, "Waiting for GNSS fix and UTC time sync...");
     while (1) {
-        gps_fix_t fix = drv_4g_gnss_get_fix();
-        
+        gps_fix_t fix = drv_4g_gnss_get_fix(); 
         if (fix.is_fixed && fix.is_time_synced) {
-            ESP_LOGI(TAG, "[LOCKED] Master GPS Fixed! System time is synced to UTC.");
-            break; 
+            break;
         }
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(1000)); 
+    }
+    ESP_LOGI(TAG, "Master time synchronized. Entering experiment scheduler.");
+
+    // ==========================================
+    // Experiment Scheduling Loop
+    // ==========================================
+    sync_pkt_t poll_pkt = {.type = MSG_TYPE_POLL, .seq_num = 0};
+    schedule_pkt_t schedule_pkt = {.type = MSG_TYPE_SCHEDULE, .duration_sec = EXPERIMENT_DURATION_SEC};
+
+    for (int iter = 0; iter < EXPERIMENT_ITERATIONS; iter++) {
+        uint32_t current_freq = freq_schedule[iter];
+        ESP_LOGI(TAG, "------------------------------------------------");
+        ESP_LOGI(TAG, "Starting iteration %d/%d. Target frequency: %lu Hz", iter + 1, EXPERIMENT_ITERATIONS, current_freq);
+
+        // 1. Create CSV file for the current iteration
+        char filename[64];
+        sprintf(filename, "/sdcard/exp02_%luHz_iter%d.csv", current_freq, iter + 1);
+        f_log = fopen(filename, "w");
+        if (f_log) {
+            fprintf(f_log, "RecvTime_us,NodeID,SeqNum,SendTime_us,Latency_us\n");
+            fflush(f_log);
+            ESP_LOGI(TAG, "Log file created: %s", filename);
+        } else {
+            ESP_LOGE(TAG, "Failed to create log file: %s", filename);
+        }
+
+        // 2. Polling phase to ensure all Slaves are ready
+        node_ready[0] = false; node_ready[1] = false; node_ready[2] = false;
+        ESP_LOGI(TAG, "Polling Slave nodes for readiness...");
+        while (!(node_ready[0] && node_ready[1] && node_ready[2])) {
+            esp_now_send(broadcast_mac, (uint8_t *)&poll_pkt, sizeof(poll_pkt));
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+        ESP_LOGI(TAG, "All Slave nodes reported READY.");
+
+        // 3. Calculate target start time and broadcast schedule
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        int64_t now_us = ((int64_t)tv.tv_sec * 1000000LL) + tv.tv_usec;
+        
+        // Schedule start time: 10 seconds from current absolute time
+        schedule_pkt.target_start_time_us = now_us + 10000000LL; 
+        schedule_pkt.frequency_hz = current_freq;
+
+        ESP_LOGI(TAG, "Broadcasting SCHEDULE. Experiment starting in 10 seconds.");
+        for (int i = 0; i < 3; i++) {
+            esp_now_send(broadcast_mac, (uint8_t *)&schedule_pkt, sizeof(schedule_pkt));
+            vTaskDelay(pdMS_TO_TICKS(100)); // Send multiple times to prevent packet loss
+        }
+
+        // 4. Wait for the experiment to run (10s initial delay + duration + 2s buffer)
+        uint32_t wait_time_sec = 10 + EXPERIMENT_DURATION_SEC + 2;
+        ESP_LOGI(TAG, "Listening for incoming data for %lu seconds...", wait_time_sec);
+        vTaskDelay(pdMS_TO_TICKS(wait_time_sec * 1000));
+
+        // 5. Finalize log file
+        if (f_log) {
+            fflush(f_log);
+            fsync(fileno(f_log));
+            fclose(f_log);
+            f_log = NULL;
+            ESP_LOGI(TAG, "Iteration %d completed. Data successfully saved.", iter + 1);
+        }
+
+        // 6. Delay between iterations
+        if (iter < EXPERIMENT_ITERATIONS - 1) {
+            ESP_LOGI(TAG, "Waiting 10 seconds before starting the next iteration...");
+            vTaskDelay(pdMS_TO_TICKS(10000));
+        }
     }
 
-    // ---------------------------------------------------------
-    // 3. ESP-NOW 初始化與註冊接收端
-    // ---------------------------------------------------------
-    ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(on_data_recv));
-    // 註：Master 在這個實驗只負責收，不負責主動發，所以不用 add_peer
-
-    ESP_LOGI(TAG, "Master Ready. Waiting for Unicast dummy data from Slaves...");
-
-    // ---------------------------------------------------------
-    // 4. 啟動報表列印背景任務
-    // ---------------------------------------------------------
-    xTaskCreate(stats_print_task, "stats_task", 4096, NULL, 5, NULL);
+    ESP_LOGI(TAG, "All experiment iterations completed successfully.");
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
 }
