@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -12,41 +13,60 @@
 #include "driver/uart.h"
 
 #include "sync_experiment_defs.h"
-#include "drv_gnss_sync.h" // 引入你提供的 GPS 同步驅動
+#include "drv_gnss_sync.h" 
 
 // ==========================================
-// 燒錄前必改：設定這塊板子的編號 ("S1" ~ "S4")
+// 燒錄前必改：設定這塊板子的編號 ("S1", "S2", "S3")
 // ==========================================
-#define MY_NODE_ID "S2" 
+#define MY_NODE_ID "S1" 
 
 static const char *TAG = "SYNC_SLAVE";
-static uint8_t master_mac[6] = {0x2C, 0xBC, 0xBB, 0xA8, 0x4B, 0x5C};
+
+// 填入獨立廣播端 (Trigger) MCU 的 MAC 位址
+static uint8_t trigger_mac[6] = {0x2C, 0xBC, 0xBB, 0xA8, 0x4B, 0x5C};
 
 /**
- * @brief ESP-NOW 接收回調：同步實驗核心
+ * @brief ESP-NOW 接收回調：處理同步與點名要求
  */
 static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
     if (len != sizeof(sync_pkt_t)) return;
     sync_pkt_t *recv_pkt = (sync_pkt_t *)data;
 
+    // 1. 處理高頻率的同步觸發訊號 (MSG_TYPE_SYNC)
     if (recv_pkt->type == MSG_TYPE_SYNC) {
-        // 1. 收到觸發的瞬間，立刻抓取「真實系統時間」
         struct timeval tv;
-        gettimeofday(&tv, NULL);
+        gettimeofday(&tv, NULL); // 抓取被 PPS 完美校正過的絕對時間
 
-        // 2. 打包回傳
         sync_pkt_t report_pkt;
+        memset(&report_pkt, 0, sizeof(sync_pkt_t));
         report_pkt.type = MSG_TYPE_REPORT;
         report_pkt.seq_num = recv_pkt->seq_num;
         strncpy(report_pkt.node_id, MY_NODE_ID, 4);
-        
-        // 填入秒與微秒
         report_pkt.tv_sec = (int64_t)tv.tv_sec;
         report_pkt.tv_usec = tv.tv_usec;
 
-        // 隨機避讓後回傳 (0~10ms)
+        // 隨機避讓 (0~10ms) 避免資料回傳空中撞包
         vTaskDelay(pdMS_TO_TICKS(esp_random() % 10));
         esp_now_send(recv_info->src_addr, (uint8_t *)&report_pkt, sizeof(report_pkt));
+    }
+    // 2. 處理 Trigger 批次實驗前的點名要求 (MSG_TYPE_POLL)
+    else if (recv_pkt->type == MSG_TYPE_POLL) {
+        gps_fix_t fix = gnss_get_fix(); 
+        
+        // 只有在 GPS 完美鎖定且 PPS 已經同步的情況下，才大聲回答 READY
+        if (fix.is_fixed && fix.is_time_synced) {
+            sync_pkt_t ready_pkt;
+            memset(&ready_pkt, 0, sizeof(sync_pkt_t));
+            ready_pkt.type = MSG_TYPE_READY;
+            strncpy(ready_pkt.node_id, MY_NODE_ID, 4);
+            
+            // 隨機避讓 (0~50ms)，避免 4 台節點同時回覆導致 2.4GHz 碰撞
+            vTaskDelay(pdMS_TO_TICKS(esp_random() % 50)); 
+            esp_now_send(recv_info->src_addr, (uint8_t *)&ready_pkt, sizeof(ready_pkt));
+            ESP_LOGI(TAG, "[POLL] Answered READY to Trigger.");
+        } else {
+            ESP_LOGW(TAG, "[POLL] Received poll, but GPS is NOT synced. Ignoring.");
+        }
     }
 }
 
@@ -72,62 +92,23 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(on_data_recv));
     esp_now_peer_info_t peer = {.channel = 0, .encrypt = false};
-    memcpy(peer.peer_addr, master_mac, 6);
+    memcpy(peer.peer_addr, trigger_mac, 6);
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
 
-    // 4. 等待 GPS 定位鎖定與時間同步完成
-    ESP_LOGI(TAG, "Node %s: Waiting for GPS Fix and PPS Sync...", MY_NODE_ID);
-    
+    ESP_LOGI(TAG, "Initialization Complete. Entering Idle Monitoring Mode...");
+
+    // 4. 純狀態監控迴圈 (不再主動發送任何 ESP-NOW 封包)
     while (1) {
-        gps_fix_t fix = gnss_get_fix(); // 取得目前 GPS 狀態
+        gps_fix_t fix = gnss_get_fix(); 
         
         if (fix.is_fixed && fix.is_time_synced) {
-            // 獲取當前系統時間
-            time_t now;
-            struct tm timeinfo;
-            char strftime_buf[64];
-            time(&now); 
-            
-            // 加上 8 小時的秒數 (8 * 3600 = 28800) 轉換為 UTC+8
-            time_t local_now = now + 28800; 
-            
-            // 改用 gmtime_r 避免受到系統 TZ 變數 (UTC) 的影響
-            gmtime_r(&local_now, &timeinfo); 
-            strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
-
-            ESP_LOGI(TAG, "Drone Node Position LOCKED");
-            ESP_LOGI(TAG, "Lat: %d, Lon: %d, Alt: %.2f m", 
-                    fix.latitude, fix.longitude, fix.altitude);
-            // 標註為 UTC+8
-            ESP_LOGI(TAG, "Current System Time: %s (UTC+8)", strftime_buf);
-            
-            break;
+            ESP_LOGI(TAG, "Status: [LOCKED] Lat: %d, Lon: %d | Standing by for POLL/SYNC", 
+                     fix.latitude, fix.longitude);
+        } else {
+            ESP_LOGW(TAG, "Status: [SEARCHING] Waiting for 3D Fix or PPS Pulse...");
         }
-        
-        // 每秒檢查一次狀態
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
 
-    // 5. 發送 READY 給 Master
-    sync_pkt_t ready_pkt = {
-        .type = MSG_TYPE_READY,
-        .seq_num = 0,
-        .tv_sec = 0,   // 改為秒
-        .tv_usec = 0   // 改為微秒
-    };
-    strncpy(ready_pkt.node_id, MY_NODE_ID, 4);
-    
-    ESP_LOGI(TAG, "Localization complete. Reporting READY to Master.");
-    
-    // 持續發送直到 Master 收到 (或實驗開始)
-    for(int i=0; i<5; i++) {
-        esp_now_send(master_mac, (uint8_t *)&ready_pkt, sizeof(ready_pkt));
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
-    ESP_LOGI(TAG, "Slave %s is standing by for Sync pulses...", MY_NODE_ID);
-    
-    while(1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        // 每 2 秒印一次狀態心跳包
+        vTaskDelay(pdMS_TO_TICKS(2000)); 
     }
 }

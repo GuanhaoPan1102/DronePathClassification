@@ -128,69 +128,81 @@ void app_main(void)
     memcpy(peer.peer_addr, broadcast_mac, 6);
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
 
-    // 等待節點報到邏輯
-    ESP_LOGI(TAG, "Waiting for nodes to report READY...");
-    while (1) {
-        if (WAIT_ALL_NODES) {
-            // 實驗室：必須等齊 4 台
-            if (node_ready[0] && node_ready[1] && node_ready[2] && node_ready[3]) break;
-        } else {
-            // 居家：只要 M1(或 S1) 準備好就開跑
-            if (node_ready[0]) break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    
-    ESP_LOGI(TAG, "Nodes ready. Experiment starts in 5s.");
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
     // ==========================================
-    // 絕對精準 5Hz (200ms) 廣播與採樣迴圈
+    // 批次實驗外層迴圈 (執行 6 次，每次 5 分鐘)
     // ==========================================
+    sync_pkt_t poll_pkt = {.type = MSG_TYPE_POLL, .seq_num = 0};
     sync_pkt_t sync_pkt = {.type = MSG_TYPE_SYNC};
     
-    // 記錄大爆炸的絕對起跑線 (Tick 基準點)
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(200); // 嚴格定義 200ms 週期
+    for (int iteration = 1; iteration <= EXPERIMENT_ITERATIONS; iteration++) {
+        ESP_LOGI(TAG, "============================================");
+        ESP_LOGI(TAG, "Preparing for Iteration %d / %d", iteration, EXPERIMENT_ITERATIONS);
+        ESP_LOGI(TAG, "============================================");
 
-    while (current_seq < MAX_SAMPLES) {
-        
-        // 會計師結帳：多退少補，確保每一圈都在絕對完美的整數週期點醒來
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        // 1. 重置所有節點的準備狀態
+        node_ready[0] = false; node_ready[1] = false; 
+        node_ready[2] = false; node_ready[3] = false;
 
-        current_seq++;
-        
-        // 清空緩衝區，沒回傳的節點就會自動補 0
-        memset(&current_sample, 0, sizeof(sample_line_t));
-        sync_pkt.seq_num = current_seq;
-        
-        // 1. 觸發廣播 (空中物理耗時 < 1ms)
-        esp_now_send(broadcast_mac, (uint8_t *)&sync_pkt, sizeof(sync_pkt));
-
-        // 2. 防禦性等待 (20ms)
-        // 完美涵蓋節點端的 esp_random() % 10 隨機避讓，以及 FreeRTOS 任務切換抖動
-        // 確保所有節點的資料都能透過 on_data_recv 填入 current_sample 中
-        vTaskDelay(pdMS_TO_TICKS(20));
-
-        // 3. 寫入 SD 卡 (可能耗時 2ms ~ 50ms 不等，但不用怕，vTaskDelayUntil 會處理)
-        if (f_log) {
-            fprintf(f_log, "%lu,%lld,%ld,%lld,%ld,%lld,%ld,%lld,%ld\n", 
-                    current_seq, 
-                    current_sample.s1_tv_sec, current_sample.s1_tv_usec,
-                    current_sample.s2_tv_sec, current_sample.s2_tv_usec,
-                    current_sample.s3_tv_sec, current_sample.s3_tv_usec,
-                    current_sample.s4_tv_sec, current_sample.s4_tv_usec);
+        // 2. 點名循環 (不斷發送 POLL，直到所有需要的節點都回傳 READY)
+        ESP_LOGI(TAG, "Polling nodes for READY status...");
+        while (1) {
+            esp_now_send(broadcast_mac, (uint8_t *)&poll_pkt, sizeof(poll_pkt));
             
-            // 每 50 筆 (10秒) 刷新一次實體卡片，防掉電
-            if (current_seq % 50 == 0) {
-                fflush(f_log);
-                fsync(fileno(f_log)); 
-                ESP_LOGI(TAG, "Progress: %lu / %d", current_seq, MAX_SAMPLES);
+            if (WAIT_ALL_NODES) {
+                if (node_ready[0] && node_ready[1] && node_ready[2] && node_ready[3]) break;
+            } else {
+                if (node_ready[0]) break; // 居家模式只要 M1/S1 活著就過
             }
+            vTaskDelay(pdMS_TO_TICKS(1000)); // 每秒點名一次
+        }
+        
+        ESP_LOGI(TAG, "All required nodes are READY!");
+        ESP_LOGI(TAG, "Iteration %d will start in 5 seconds...", iteration);
+        vTaskDelay(pdMS_TO_TICKS(5000)); // 給予 5 秒的穩定緩衝期
+
+        // 3. 執行單次 5 分鐘的採樣 (內層迴圈)
+        TickType_t xLastWakeTime = xTaskGetTickCount();
+        const TickType_t xFrequency = pdMS_TO_TICKS(SYNC_INTERVAL_MS);
+        int samples_this_iter = 0;
+
+        while (samples_this_iter < MAX_SAMPLES) {
+            vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+            current_seq++;          // 總序號 (1 ~ 9000)
+            samples_this_iter++;    // 單次迴圈計數器 (1 ~ 1500)
+            
+            memset(&current_sample, 0, sizeof(sample_line_t));
+            sync_pkt.seq_num = current_seq;
+            
+            esp_now_send(broadcast_mac, (uint8_t *)&sync_pkt, sizeof(sync_pkt));
+
+            vTaskDelay(pdMS_TO_TICKS(20)); // 防禦性等待收集回傳
+
+            if (f_log) {
+                fprintf(f_log, "%lu,%lld,%ld,%lld,%ld,%lld,%ld,%lld,%ld\n", 
+                        current_seq, 
+                        current_sample.s1_tv_sec, current_sample.s1_tv_usec,
+                        current_sample.s2_tv_sec, current_sample.s2_tv_usec,
+                        current_sample.s3_tv_sec, current_sample.s3_tv_usec,
+                        current_sample.s4_tv_sec, current_sample.s4_tv_usec);
+            }
+        }
+
+        // 4. 單次實驗結束，強制將緩衝區寫入 SD 卡物理磁區
+        if (f_log) {
+            fflush(f_log);
+            fsync(fileno(f_log)); 
+        }
+        ESP_LOGI(TAG, "Iteration %d completed. (%lu total samples collected)", iteration, current_seq);
+        
+        // 如果還沒到最後一次，休息 10 秒後再開始下一輪的點名
+        if (iteration < EXPERIMENT_ITERATIONS) {
+            ESP_LOGI(TAG, "Taking a 10-second break before next iteration...");
+            vTaskDelay(pdMS_TO_TICKS(10000));
         }
     }
 
     if (f_log) fclose(f_log);
-    ESP_LOGI(TAG, "Experiment Completed. Data perfectly saved.");
-    while(1) vTaskDelay(1000);
+    ESP_LOGI(TAG, "ALL EXPERIMENTS COMPLETED SUCCESSFULLY! Total Data: %lu", current_seq);
+    while(1) vTaskDelay(pdMS_TO_TICKS(10000));
 }
